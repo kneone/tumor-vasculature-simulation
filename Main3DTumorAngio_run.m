@@ -1,0 +1,486 @@
+%% TumorGrowth_Optimized_GPU_Part1.m
+% =========================================================================
+% 使用 GPU 加速对肿瘤生长和血管生成仿真进行部分加速
+% =========================================================================
+function Main3DTumorAngio_run(iniVessCell,fileName)
+tic;  % 记录总执行时间
+%% ============ 0. 创建结果保存的文件夹 ============
+filepath = cd;
+fil = fullfile(filepath, 'TumorGrowth_Results');
+
+if ~exist(fil, 'dir'),      mkdir(fil);      end
+%% ============ 1. 全局变量声明 ============
+global len N slen wlen nod3xyz nutr pres TAF waste activity celltype cell_energy drug
+global vess vess_tag vess_age hotpoint index_bias stackvalue stackcount vessgrowth_flag vess_tag_day
+global branchrecord sprout_index nec
+
+%% ============ 2. 创建网格及初始化 ============
+len   = 10;       % 单位：mm
+N     = 201;      % 网格数
+slen  = N*N; 
+wlen  = N*N*N;
+
+% 为大规模变量分配 GPU 数组（PDE 部分将用到）
+nutr        = gpuArray(ones(1, wlen));   
+waste       = gpuArray(ones(1, wlen));     
+TAF         = gpuArray(zeros(1, wlen));
+drug        = gpuArray(zeros(1, wlen));
+pres        = gpuArray(zeros(1, wlen));     
+activity    = gpuArray(zeros(1, wlen));
+
+% 细胞及血管类数据，因自定义函数多在 CPU 上处理，暂保持 CPU 数组
+celltype    = zeros(1, wlen);
+cell_energy = zeros(1, wlen);
+
+vess     = cell(1, wlen);          
+vess_tag = zeros(1, wlen);
+vess_age = zeros(1, wlen);
+vess_tag_day = zeros(60, 201, 201);
+day_counter = 1;
+
+hotpoint     = zeros(1, wlen);
+branchrecord = zeros(1, wlen);
+
+stackvalue      = [0 0];
+stackcount      = 0;
+vessgrowth_flag = 0;
+
+xn        = linspace(0, len, N);
+[Y, X, Z] = meshgrid(xn);  
+nod3xyz   = [X(:), Y(:), Z(:)];
+
+nec = 1e-4;  % Necrosis 标记
+
+% --- 边界点识别 ---
+boundary = DetectBoundary(nod3xyz, len);  
+
+% --- 初始化肿瘤细胞及血管 ---
+InitCancerCell();     % 确保自定义函数与此文件在同一路径下
+hold on;
+Vasculature3D();
+% saveas(gca, fullfile(subfold1, 'IniVasculator3D.fig'));
+hold off;
+
+X = zeros(1, length(iniVessCell));
+Y = zeros(1, length(iniVessCell));
+Z = zeros(1, length(iniVessCell));
+
+for i = 1:length(iniVessCell)
+    X(i) = iniVessCell{i}(1);
+    Y(i) = iniVessCell{i}(2);
+    Z(i) = iniVessCell{i}(3);
+end
+
+
+vindex = zeros(size(X));
+for i = 1:length(X)
+    xx = round(X(i)/20/0.05);
+    yy = round(Y(i)/20/0.05);
+    zz = round(Z(i)/20/0.05);
+    vindex(i) = xx + yy*N + zz*slen;    
+end
+
+hold on;
+scatter3(nod3xyz(vindex,1)*20, nod3xyz(vindex,2)*20, nod3xyz(vindex,3)*20, 'g*');
+
+for j = 1:length(vindex)
+    s = vindex(j);
+    vess{s}.count   = 0;
+    vess{s}.pare    = [];
+    vess{s}.son     = [];
+    vess{s}.direct  = [];
+end
+
+vess_tag(vindex) = 0.95;
+vess_age(vindex) = 1;
+
+vindexsave     = vindex;  % 保存初始血管索引
+old_vindexsave = vindex;  %#ok<NASGU> 
+
+%% ============ 3. 各种模型参数 ============
+totDays = 60;           
+tau     = totDays*24*3600;  
+L      = 1e-2;         
+k      = 1/(len*(N-1));  
+h      = 1/(N-1);
+
+c0       = 4.3e-4;  
+n0       = 8.4;     
+w0       = 10.5;    
+d0       = 2.13;
+
+Dn       = 8e-14;   
+rho_n0   = 6.8e-4;  
+lambda_n0= 3.0e-5;
+
+Dw       = 4e-14;  
+rho_w0   = 1e-5;    
+lambda_w0= 2.5e-5;
+
+Dc       = 1.2e-13;
+rho_c0   = 2e-9;
+lambda_c0= 0;
+
+Dd       = 1.5e-14; 
+lambda_d0= 2.5e-7;  
+lambda_decay= 1.0e-8;
+
+pres_scale= 1;   
+cap_pres  = 30;  
+p0        = 60*pres_scale;
+Kp        = 4.5e-15;
+u0        = 5e-6;
+pv        = cap_pres/p0;
+sigma0    = 0.15;
+amplitude0= 0.08*pres_scale;
+
+Lp       = 2.8e-9;
+sigmaT   = 0.82;
+sigmaD   = 0.1;
+Pvp      = 1.49e-9;
+piV      = 0.3546/p0;
+piI      = 0.2667/p0;
+k_AR2    = 500;
+
+% --- 预计算 index_bias / pres_bias（CPU） ---
+kn          = 1;
+index_bias0 = [];
+seq         = -kn:kn;
+for ii=-kn:kn
+   index_bias0 = [index_bias0, seq + N*ii];
+end
+index_bias = [];
+for jj=-kn:kn
+   index_bias = [index_bias, index_bias0 + slen*jj];
+end
+
+%%----------此处可更改knn值----------%%
+knn         = 10; %原算法为20
+pres_bias0  = [];
+seq         = -knn:knn;
+for ii=-knn:knn
+    pres_bias0 = [pres_bias0, seq + N*ii];
+end
+pres_bias = [];
+for jj=-knn:knn
+    pres_bias = [pres_bias, pres_bias0 + slen*jj];  
+end
+
+t1 = setdiff(1:wlen, boundary); % 用于梯度计算
+
+%% ============ 4. 给药 / 迭代次数等 ============
+calit      = 1981;
+%calit = 991;
+Cd         = [zeros(1,1000), ones(1,1000)];  
+sprout_index = [];
+kill       = 10;       % 药物杀伤强度
+startime   = 400;      % 开始血管生成迭代步
+
+% 记录细胞数量（CPU记录即可）
+activenumber     = zeros(1, calit);
+quiescentnumber  = zeros(1, calit);
+necrosisnumber   = zeros(1, calit);
+
+% 控制日志和绘图保存频率
+printFrequency = 10;   
+plotFrequency  = 33;   
+
+disp('初始化结束，进入模拟...');
+%% TumorGrowth_Optimized_GPU_Part2.m
+% ========= 5. 主循环 =========
+for iteration = 1:calit
+    
+    % 5.1 统计细胞数（CPU上统计）
+    activenumber(iteration)    = nnz(celltype == 1);
+    quiescentnumber(iteration) = nnz(celltype == 0.95);
+    necrosisnumber(iteration)  = nnz(celltype == nec);
+    
+    % if mod(iteration, printFrequency) == 1
+    %     disp(['Iteration ', num2str(iteration), ' / ', num2str(calit)]);
+    %     fprintf('  Living: %d, Quiescent: %d, Necrosis: %d\n', ...
+    %         activenumber(iteration), quiescentnumber(iteration), necrosisnumber(iteration));
+    % end
+    
+    if mod(iteration, plotFrequency) == 1
+        plot(iteration, activenumber(iteration) + quiescentnumber(iteration) + necrosisnumber(iteration), 'b*');
+        hold on;
+        plot(iteration, activenumber(iteration), 'ro');
+        plot(iteration, quiescentnumber(iteration), 'gs');
+        plot(iteration, necrosisnumber(iteration), 'k^');
+        drawnow;
+    end
+    
+    % 5.2 判断给药时机
+    if iteration >= 1321
+        ddf = 1.0;
+    else
+        ddf = 0.0;
+    end
+    
+    % 5.3 将 PDE 相关数据转换到 GPU（临时转换，并在运算后 gather 回 CPU）
+    t  = reshape(gpuArray(TAF), [N, N, N]);
+    n  = reshape(gpuArray(nutr), [N, N, N]);
+    v  = reshape(gpuArray(vess_tag), [N, N, N]);
+    % celltype 在此处仅用于 PDE中的乘法，先转换为 gpuArray
+    c  = reshape(gpuArray(celltype), [N, N, N]);
+    w0temp  = reshape(gpuArray(waste), [N, N, N]);
+    v_age3d = reshape(gpuArray(vess_age), [N, N, N]);
+    act     = reshape(gpuArray(activity), [N, N, N]);
+    d3d     = reshape(gpuArray(drug), [N, N, N]);
+    
+    v_rad = v_age3d ./ (k_AR2 + v_age3d);
+    
+    % 5.4 压力场更新（每20步一次，依旧在 CPU 部分进行，结果存入 GPU 数组）
+    if mod(iteration-1,30) == 0
+        pres = zeros(1, wlen, 'gpuArray');  % 在 GPU 上分配
+        cindex = find(celltype ~= 0);  % CPU 索引
+        vindex_cpu = find(vess_tag > 0);
+        
+        % 肿瘤细胞贡献压力（循环）
+        for tt = 1:numel(cindex)
+            s = cindex(tt);
+            density = nnz(celltype(s + index_bias) > 0) / numel(index_bias);
+            dist = sqrt(sum((nod3xyz(s + pres_bias,:) - nod3xyz(s,:)).^2, 2));
+            ampl = amplitude0;
+            sigma_loc = sigma0 * density^2/(density^2 + 0.5^2) + 0.05;
+            idx = s + pres_bias;
+            pres(idx) = pres(idx) + ampl * exp(- (dist'.^2) / (2*sigma_loc^2));
+        end
+        
+        % 血管细胞贡献压力
+        for ss = 1:numel(vindex_cpu)
+            vind = vindex_cpu(ss);
+            density = nnz(celltype(vind + index_bias) > 0) / numel(index_bias);
+            ampl = 0.01 * density^2/(density^2 + 0.5^2);
+            dist = sqrt(sum((nod3xyz(vind + pres_bias,:) - nod3xyz(vind,:)).^2, 2));
+            sigma_loc = sigma0 * density^2/(density^2 + 0.5^2) + 0.05;
+            idx = vind + pres_bias;
+            pres(idx) = pres(idx) + ampl * exp(- (dist'.^2) / (2*sigma_loc^2));
+        end
+        
+        pres = pres / p0;
+        
+        % 将 pres 转回 CPU 计算梯度，再转到 GPU
+        pres_cpu = gather(pres);
+        gradp = zeros(3, wlen);
+        gradp(1, t1) = (pres_cpu(t1+1) - pres_cpu(t1-1)) / (2*h);
+        gradp(2, t1) = (pres_cpu(t1+N) - pres_cpu(t1-N)) / (2*h);
+        gradp(3, t1) = (pres_cpu(t1+slen) - pres_cpu(t1-slen)) / (2*h);
+        ux = -Kp*p0/(u0*L)*reshape(gradp(1,:), N, N, N);
+        uy = -Kp*p0/(u0*L)*reshape(gradp(2,:), N, N, N);
+        uz = -Kp*p0/(u0*L)*reshape(gradp(3,:), N, N, N);
+        ux = gpuArray(ux); uy = gpuArray(uy); uz = gpuArray(uz);
+    end
+    
+    p = reshape(gpuArray(pres), [N, N, N]);
+    weight = (cap_pres - p.*p0) ./ cap_pres;
+    weight(weight < 0) = 0;
+    
+    % 5.5 Nutrient PDE（在 GPU 上运算）
+    coefA = Dn*tau*k/(L^2*h^2);
+    coefB = (tau*k*u0)/(L*2*h);
+    c1 = 1 - 6*coefA;
+    n(2:N-1,2:N-1,2:N-1) = c1 .* n(2:N-1,2:N-1,2:N-1) ...
+       + (coefA - coefB*ux(2:N-1,2:N-1,2:N-1)) .* n(3:N,2:N-1,2:N-1) ...
+       + (coefA - coefB*uy(2:N-1,2:N-1,2:N-1)) .* n(2:N-1,3:N,2:N-1) ...
+       + (coefA - coefB*uz(2:N-1,2:N-1,2:N-1)) .* n(2:N-1,2:N-1,3:N) ...
+       + (coefA + coefB*ux(2:N-1,2:N-1,2:N-1)) .* n(1:N-2,2:N-1,2:N-1) ...
+       + (coefA + coefB*uy(2:N-1,2:N-1,2:N-1)) .* n(2:N-1,1:N-2,2:N-1) ...
+       + (coefA + coefB*uz(2:N-1,2:N-1,2:N-1)) .* n(2:N-1,2:N-1,1:N-2) ...
+       + k*tau/n0*rho_n0 .* v_rad(2:N-1,2:N-1,2:N-1) .* weight(2:N-1,2:N-1,2:N-1) .* v(2:N-1,2:N-1,2:N-1) ...
+       - k*tau/n0*lambda_n0 .* act(2:N-1,2:N-1,2:N-1) .* c(2:N-1,2:N-1,2:N-1);
+    temp_n = n;
+    temp_n([1 N],:,:) = 1;
+    temp_n(:,[1 N],:) = 1;
+    temp_n(:,:,[1 N]) = 1;
+    nutr = gather(temp_n(:)');  % 更新 nutr (回到 CPU)
+    
+    % 5.6 Waste PDE（GPU运算）
+    w = reshape(gpuArray(waste), [N, N, N]);
+    coefAw = Dw*tau*k/(L^2*h^2);
+    c1w = 1 - 6*coefAw;
+    w(w<1) = 1;
+    act = n./(n+1)*2 .* exp(-(w-1).^4 / 0.2);
+    w(2:N-1,2:N-1,2:N-1) = c1w .* w(2:N-1,2:N-1,2:N-1) ...
+       + (coefAw - coefB*ux(2:N-1,2:N-1,2:N-1)) .* w(3:N,2:N-1,2:N-1) ...
+       + (coefAw - coefB*uy(2:N-1,2:N-1,2:N-1)) .* w(2:N-1,3:N,2:N-1) ...
+       + (coefAw - coefB*uz(2:N-1,2:N-1,2:N-1)) .* w(2:N-1,2:N-1,3:N) ...
+       + (coefAw + coefB*ux(2:N-1,2:N-1,2:N-1)) .* w(1:N-2,2:N-1,2:N-1) ...
+       + (coefAw + coefB*uy(2:N-1,2:N-1,2:N-1)) .* w(2:N-1,1:N-2,2:N-1) ...
+       + (coefAw + coefB*uz(2:N-1,2:N-1,2:N-1)) .* w(2:N-1,2:N-1,1:N-2) ...
+       + k*tau/w0*(rho_w0.*act(2:N-1,2:N-1,2:N-1).* c(2:N-1,2:N-1,2:N-1)) ...
+       - k*tau/w0*(lambda_w0.*weight(2:N-1,2:N-1,2:N-1).* v(2:N-1,2:N-1,2:N-1).* v_rad(2:N-1,2:N-1,2:N-1));
+    temp_w = w;
+    temp_w([1 N],:,:) = 1;
+    temp_w(:,[1 N],:) = 1;
+    temp_w(:,:,[1 N]) = 1;
+    waste = gather(temp_w(:)');
+    activity = gather(act(:)');
+    
+    % 5.7 TAF PDE（GPU 运算）
+    coefAc = Dc*tau*k/(L^2*h^2);
+    c1c = 1 - 6*coefAc;
+    n_clip = min(n,1);
+    t(2:N-1,2:N-1,2:N-1) = c1c .* t(2:N-1,2:N-1,2:N-1) ...
+       + (coefAc - coefB*ux(2:N-1,2:N-1,2:N-1)) .* t(3:N,2:N-1,2:N-1) ...
+       + (coefAc - coefB*uy(2:N-1,2:N-1,2:N-1)) .* t(2:N-1,3:N,2:N-1) ...
+       + (coefAc - coefB*uz(2:N-1,2:N-1,2:N-1)) .* t(2:N-1,2:N-1,3:N) ...
+       + (coefAc + coefB*ux(2:N-1,2:N-1,2:N-1)) .* t(1:N-2,2:N-1,2:N-1) ...
+       + (coefAc + coefB*uy(2:N-1,2:N-1,2:N-1)) .* t(2:N-1,1:N-2,2:N-1) ...
+       + (coefAc + coefB*uz(2:N-1,2:N-1,2:N-1)) .* t(2:N-1,2:N-1,1:N-2) ...
+       + k*tau/c0*rho_c0.*(1 - n_clip(2:N-1,2:N-1,2:N-1)).* c(2:N-1,2:N-1,2:N-1) ...
+       - k*tau/c0*lambda_c0.*v_rad(2:N-1,2:N-1,2:N-1).* v(2:N-1,2:N-1,2:N-1);
+    t([1 N],:,:) = 0;
+    t(:,[1 N],:) = 0;
+    t(:,:,[1 N]) = 0;
+    TAF = gather(t(:));
+    
+    % 5.8 Drug PDE（GPU 运算）
+    coefAd = Dd*tau*k/(L^2*h^2);
+    c1d = 1 - 6*coefAd;
+    Fv = Lp*p0.*(250*v_rad(2:N-1,2:N-1,2:N-1)) ...
+         .* max((pv - p(2:N-1,2:N-1,2:N-1) - sigmaT*(piV-piI)), 0);
+    Pev = Lp*p0.*max((pv - p(2:N-1,2:N-1,2:N-1) - sigmaT*(piV-piI)), 0) ...
+          .*(1 - sigmaD)./Pvp;
+    rho_d = Fv.*(1-sigmaD)*d0.*Cd(iteration) + ...
+            Pvp*(250*v_rad(2:N-1,2:N-1,2:N-1))*d0.*(Cd(iteration)- d3d(2:N-1,2:N-1,2:N-1)) ...
+            .*(Pev./(exp(Pev)-1+eps));
+    lambda_d1 = lambda_d0 .* act(2:N-1,2:N-1,2:N-1);
+    lambda_d2 = lambda_decay .* d3d(2:N-1,2:N-1,2:N-1);
+    c_new = c(2:N-1,2:N-1,2:N-1);
+    c_new(c_new>1) = 0;
+    d3d(2:N-1,2:N-1,2:N-1) = c1d .* d3d(2:N-1,2:N-1,2:N-1) ...
+       + (coefAd - coefB*ux(2:N-1,2:N-1,2:N-1)) .* d3d(3:N,2:N-1,2:N-1) ...
+       + (coefAd - coefB*uy(2:N-1,2:N-1,2:N-1)) .* d3d(2:N-1,3:N,2:N-1) ...
+       + (coefAd - coefB*uz(2:N-1,2:N-1,2:N-1)) .* d3d(2:N-1,2:N-1,3:N) ...
+       + (coefAd + coefB*ux(2:N-1,2:N-1,2:N-1)) .* d3d(1:N-2,2:N-1,2:N-1) ...
+       + (coefAd + coefB*uy(2:N-1,2:N-1,2:N-1)) .* d3d(2:N-1,1:N-2,2:N-1) ...
+       + (coefAd + coefB*uz(2:N-1,2:N-1,2:N-1)) .* d3d(2:N-1,2:N-1,1:N-2) ...
+       - k*tau/d0*(lambda_d1.*c(2:N-1,2:N-1,2:N-1).*(d3d(2:N-1,2:N-1,2:N-1).^2)) ...
+       - k*tau/d0*(lambda_d2.*(1 - c_new)) ...
+       + k*tau/d0*(rho_d.*v(2:N-1,2:N-1,2:N-1));
+    d3d([1 N],:,:) = 0;
+    d3d(:,[1 N],:) = 0;
+    d3d(:,:,[1 N]) = 0;
+    drug = ddf * gather(d3d(:)');
+    
+    % 5.9 肿瘤细胞生长（CPU更新 celltype 和 cell_energy）
+    cellindex       = (celltype > nec);   
+    test_act        = activity(cellindex);
+    test_cell_energy= cell_energy(cellindex);
+    mask_active     = (test_act >= 0.5);
+    mask_quiescent  = (test_act < 0.5);
+    mask_necrosis   = (test_cell_energy <= 0);
+    
+    idxAll = find(cellindex);
+    idxA   = idxAll(mask_active);
+    idxQ   = idxAll(mask_quiescent);
+    idxN   = idxAll(mask_necrosis);
+    
+    celltype(idxA) = 1;
+    celltype(idxQ) = 0.95;
+    celltype(idxN) = nec;
+    
+    % 向量化更新：quiescent 细胞能量衰减
+    div_indexQ = find(celltype == 0.95);
+    cell_energy(div_indexQ) = cell_energy(div_indexQ) - 0.1;
+    
+    % 活跃细胞能量更新与增殖判断
+    div_indexA = find(celltype == 1);
+    div_indexA = div_indexA(randperm(numel(div_indexA)));
+    prolif_energy = 30; 
+    active_mask = cell_energy(div_indexA) >= prolif_energy;
+    idx_update = div_indexA(~active_mask);
+    cell_energy(idx_update) = cell_energy(idx_update) + activity(idx_update) ...
+         - activity(idx_update)./(activity(idx_update)+1) ...
+         - drug(idx_update).*activity(idx_update)./(activity(idx_update)+1)*kill;
+    idx_divide = div_indexA(active_mask);
+    for s = idx_divide(:)'
+         Celldivide_new(s);
+    end
+    
+    % 5.10 血管生成（CPU部分）
+    if iteration >= startime
+        vessgrowth_flag = 1;
+        if iteration == startime
+            sprout_index = vindexsave;
+        end
+        idx_vess = (vess_tag > 0);
+        vess_age(idx_vess) = vess_age(idx_vess) + 1;
+        tip_index = union(find(vess_tag==0.95), sprout_index);
+        tip_index = tip_index(randperm(numel(tip_index)));
+        for i = 1:numel(tip_index)
+            Angiogenesis3D(tip_index(i));
+        end
+        Spreadhotpoint(0.3e-3);
+        sprout_index = Sproutcheck();
+    end
+    
+    % 5.11 保存和可视化（保持原逻辑，每 plotFrequency 步）
+    % if mod(iteration-1, plotFrequency) == 0
+    %     num_day = round((iteration-1)/plotFrequency);
+    %     Visual3Dtumor();
+    %     filename = cd;
+    %     % saveas(gca, fullfile(filename, 'TumorGrowth_Results', 'Figures', ['TumorDay' num2str(num_day) '_1.fig']));
+    %     saveas(gca, fullfile(subfold1, ['TumorDay' num2str(num_day) '_' num2str(1) '.fig']));
+    % 
+    %     close;
+    % 
+    %     Visual3Dtumor3();
+    %     %saveas(gca, fullfile(filename, 'TumorGrowth_Results', 'Figures', ['TumorDay' num2str(num_day) '_2.fig']));
+    %     saveas(gca, fullfile(subfold1, ['TumorDay' num2str(num_day) '_' num2str(2) '.fig']));
+    %     close;
+    % end
+    % 
+    % if mod(iteration-1, plotFrequency) == 0
+    %     num_day = round((iteration-1)/plotFrequency);
+    %     filename = cd;
+    %     varalist = {'TAF','activenumber','act','activity','cell_energy','celltype',...
+    %                 'necrosisnumber','quiescentnumber','pres','nutr','vess_age','vess',...
+    %                 'vess_tag','waste','drug'};
+    %     %save(fullfile(filename, 'TumorGrowth_Results', 'Data', ['DataDay' num2str(num_day) '.mat']), varalist{:});
+    %     save(fullfile(subfold2, ['DataDay' num2str(num_day) '.mat']), varalist{:});
+    % end
+
+    % 5.12 保存血管2D影像（保持原逻辑，每 plotFrequency 步）
+    if mod(iteration-1, plotFrequency) == 0
+        vess_tag_3d = reshape(vess_tag, [201, 201, 201]);
+        vess_tag_proj = max(vess_tag_3d, [], 3);  % 投影到 XY 平面
+
+
+        % 保存结果到 vess_tag_day
+        if day_counter <= 60
+            vess_tag_day(day_counter, :, :) = vess_tag_proj; 
+            day_counter = day_counter + 1;
+        end
+    end
+
+end
+
+%% ============ 6. 结束，绘制最终结果 ============
+totaltime = toc;
+
+if iteration == calit
+    timestamp = datestr(now, 'yyyymmdd_HHMMSS');
+    filename = [fileName, '_', timestamp, '.mat'];
+    save(fullfile(fil, filename), 'vess_tag_day');
+end
+
+disp(['总时间 = ', num2str(totaltime), ' 秒.']);
+
+figure;
+Tumorvessel3D();  % 自定义函数：绘制 3D 肿瘤与血管
+%saveas(gca, fullfile(subfold1, 'TumorVessel3D.png'));
+hold on;
+Visual3Dtumor();  % 自定义函数：叠加 nutrient 截面
+%saveas(gca, fullfile(subfold1, 'Nutrient.fig'));
+alpha(0.6);
+xlabel('x');  ylabel('y');  zlabel('z');
+title('Final Nutrient & Vessel');
+
+box off;
+Draw3Dvessel();   % 自定义函数：绘制血管 3D 图
+% saveas(gca, fullfile(subfold1, 'FinalNutrient_Vess.fig'));
+hold off;
+clearvars;
+end
